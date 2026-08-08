@@ -1,6 +1,6 @@
 # encoding: utf-8
 """
-超短期EMA策略（自动交易版）
+小市值融资杠杆策略 / Small-Cap Margin Leverage（自动交易版）
 
 【运行逻辑】
   每日开盘前(before_open)选股，基于前一交易日数据，获取今日推荐。
@@ -10,11 +10,12 @@
 
 【筛选流程】
   1. 基础过滤：流通市值50~150亿，剔除ST/科创/创业/北交
-  2. 趋势：前日收盘 > 15日EMA
-  3. 波动：近4日振幅 <7%
+  2. 数据充足：价格序列长度足够
+  3. 趋势：前日收盘 > 15日EMA
   4. 流动性：20日日均成交额 >= 1.5亿
   5. 杠杆情绪：融资余额增加率 >5%
-  6. 取前5只买入，每只20%
+  6. 波动：近4日振幅 <7%
+  7. 取前5只买入，每只20%
 """
 from jqdata import *
 from datetime import timedelta
@@ -63,10 +64,73 @@ def initialize(context):
     run_daily(calc_sell_list, time='15:35', reference_security='000300.XSHG')     # 收盘后计算待卖出
     run_daily(my_trade, time='open', reference_security='000300.XSHG')             # 早盘执行卖出+买入
 
+def _log_section_banner(context, name):
+    """时段大标题。聚宽日志新在上，故应在本时段逻辑末尾调用，阅读时标题在上。
+
+    注意：不能用换行拼成一条 log。多行时只有首行带时间戳前缀，横线会对不齐。
+    每行单独 log.info，前缀长度一致，横线才整齐。
+    """
+    # 单行内容宽度：总宽约100 - 前缀约30；每行单独打，避免换行导致横线错位
+    # 倒序打点：适配聚宽「新在上」，阅读时为 顶栏 → 标题 → 时间 → 底栏
+    bar = '#' * 40
+    log.info(bar)
+    log.info(f"时间 {context.current_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"【{name}】")
+    log.info(bar)
+
+
+def _select_section_name(context):
+    """区分 before_open / 12:20 两次选股"""
+    t = context.current_dt.time()
+    if t.hour < 12:
+        return '开盘前选股 before_open'
+    return '午间选股 12:20'
+
+
+def _log_recommend_cards(codes, metrics, date):
+    """最终入选个股：逐票打印全部考察指标（每行单独 log，避免被截断）"""
+    if not codes:
+        log.info('今日推荐：无')
+        return
+    try:
+        ind_data = get_industry(list(codes), date=date)
+    except Exception:
+        ind_data = {}
+
+    def _f(v, fmt):
+        return fmt.format(v) if v is not None else '-'
+
+    log.info(f"今日推荐：共{len(codes)}只（以下为全部考察指标）")
+    for i, code in enumerate(codes, 1):
+        m = metrics.get(code, {})
+        try:
+            name = get_security_info(code).display_name
+        except Exception:
+            name = m.get('name', code)
+        industry = ind_data.get(code, {}).get('sw_l1', {}).get('industry_name', '未知行业')
+        close = m.get('close')
+        ema = m.get('ema')
+        avg_amount = m.get('avg_amount')
+        margin = m.get('margin_increase')
+        vib = m.get('vib')
+        circ_mv = m.get('circ_mv')
+        rel_ema = ((close - ema) / ema) if (close is not None and ema not in (None, 0)) else None
+        avg_yi = (avg_amount / 1e8) if avg_amount is not None else None
+
+        log.info(f"---- [{i}/{len(codes)}] {name} {code} ----")
+        log.info(f"  一级行业: {industry} | 流通市值: {_f(circ_mv, '{:.1f}亿')}")
+        log.info(
+            f"  收盘: {_f(close, '{:.2f}')} | EMA15: {_f(ema, '{:.2f}')} | 相对EMA: {_f(rel_ema, '{:+.2%}')}"
+        )
+        log.info(
+            f"  日均额: {_f(avg_yi, '{:.2f}亿')} | 融资增幅: {_f(margin, '{:+.2%}')} | 4日振幅: {_f(vib, '{:.2%}')}"
+        )
+
+
 def select_candidates(context):
     """开盘前执行：基于前一交易日数据，获取今日推荐"""
     ref_date = context.previous_date  # 前一交易日（开盘前无当日数据）
-    log.info(f"=== 基于 {ref_date} 数据，今日推荐 ===")
+    metrics = {}  # code -> 考察指标（供今日推荐卡片使用）
     
     # 1. 获取所有股票基本信息，过滤小市值
     q = query(
@@ -94,84 +158,135 @@ def select_candidates(context):
         st_set = set(df_st.columns[df_st.iloc[0] == True].tolist()) if not df_st.empty else set()
         codes = [c for c in codes if c not in st_set]
     df_basic = df_basic[df_basic['code'].isin(codes)].copy()
-    
-    log.info(f"[基础过滤] 小市值符合(已剔除ST/科创/创业/北交): {len(df_basic)} 只")
+    basic_count = len(df_basic)
+    circ_mv_map = dict(zip(df_basic['code'], df_basic['circulating_market_cap']))
     
     if df_basic.empty:
         g.candidates = []
+        log.info('[筛选漏斗] 基础0 → 取前0只')
+        _log_recommend_cards([], {}, ref_date)
+        log.info(f"选股基准日(前一交易日): {ref_date}")
+        _log_section_banner(context, _select_section_name(context))
         return
     
-    candidates = []
-    filtered = {'数据不足': [], '收盘低于EMA': [], '振幅过大': [], '成交额不足': [], '融资数据不足': [], '融资增加率不足': []}
-    for stock in df_basic['code']:
-        # 2. 获取历史数据
-        prices = get_price(stock, count=g.vib_period + g.ema_period, end_date=ref_date, 
+    remaining = list(df_basic['code'])
+    
+    # 2. 数据充足
+    price_cache = {}
+    need_bars = max(20, g.vib_period + g.ema_period)
+    next_remaining = []
+    drop_data = 0
+    for stock in remaining:
+        prices = get_price(stock, count=need_bars, end_date=ref_date,
                            frequency='daily', fields=['close', 'low', 'high', 'open', 'volume'])
-        if len(prices) < g.vib_period + g.ema_period:
-            filtered['数据不足'].append(stock)
+        if len(prices) < need_bars:
+            drop_data += 1
             continue
-        
-        # 3. 当日收盘 > N日EMA（趋势向上）
+        price_cache[stock] = prices
+        next_remaining.append(stock)
+    remaining = next_remaining
+    after_data = len(remaining)
+    
+    # 3. 收盘 > EMA
+    next_remaining = []
+    drop_ema = 0
+    for stock in remaining:
+        prices = price_cache[stock]
         ema = talib.EMA(prices['close'], timeperiod=g.ema_period)[-1]
         close = prices['close'][-1]
         if close <= ema:
-            filtered['收盘低于EMA'].append(f"{stock}(收盘{close:.2f}<=EMA{ema:.2f})")
+            drop_ema += 1
             continue
-        
-        # 4. 近N日振幅 <7%（波动收敛，非剧烈震荡）
-        recent_prices = prices[-g.vib_period:]
-        max_high = recent_prices['high'].max()
-        min_low = recent_prices['low'].min()
-        vib = (max_high - min_low) / min_low
-        if vib >= g.max_vib:
-            filtered['振幅过大'].append(f"{stock}(振幅{vib:.1%})")
-            continue
-        
-        # 5. 平均成交额过滤
+        metrics.setdefault(stock, {})
+        metrics[stock].update({
+            'close': float(close),
+            'ema': float(ema),
+            'circ_mv': float(circ_mv_map.get(stock)) if stock in circ_mv_map else None,
+        })
+        next_remaining.append(stock)
+    remaining = next_remaining
+    after_ema = len(remaining)
+    
+    # 4. 平均成交额
+    next_remaining = []
+    drop_amount = 0
+    for stock in remaining:
+        prices = price_cache[stock]
         avg_amount = (prices['volume'][-20:] * prices['close'][-20:]).mean()
         if avg_amount < g.min_avg_amount:
-            filtered['成交额不足'].append(f"{stock}(日均{avg_amount/1e4:.0f}万)")
+            drop_amount += 1
             continue
-        
-        # 6. 融资余额增加率 >5%（融资数据T+1，用ref_date及前日）
-        df_margin = get_mtss(stock, start_date=ref_date - timedelta(days=4), 
+        metrics.setdefault(stock, {})['avg_amount'] = float(avg_amount)
+        next_remaining.append(stock)
+    remaining = next_remaining
+    after_amount = len(remaining)
+    
+    # 5. 融资余额增加率 >5%
+    next_remaining = []
+    drop_no_data, drop_rate = 0, 0
+    for stock in remaining:
+        df_margin = get_mtss(stock, start_date=ref_date - timedelta(days=4),
                              end_date=ref_date, fields=['fin_value'])
         if len(df_margin) < 2:
-            filtered['融资数据不足'].append(stock)
+            drop_no_data += 1
             continue
-        fin_last = df_margin['fin_value'].iloc[-1]   # 前一交易日
-        fin_prev = df_margin['fin_value'].iloc[-2]   # 前前一交易日
+        fin_last = df_margin['fin_value'].iloc[-1]
+        fin_prev = df_margin['fin_value'].iloc[-2]
         if fin_prev <= 0:
-            filtered['融资数据不足'].append(stock)
+            drop_no_data += 1
             continue
         margin_increase = (fin_last - fin_prev) / fin_prev
         if margin_increase <= g.min_margin_increase:
-            filtered['融资增加率不足'].append(f"{stock}({margin_increase:.1%})")
+            drop_rate += 1
             continue
-        
-        candidates.append(stock)
+        metrics.setdefault(stock, {})['margin_increase'] = float(margin_increase)
+        next_remaining.append(stock)
+    remaining = next_remaining
+    after_margin = len(remaining)
     
-    for reason, items in filtered.items():
-        if items:
-            log.info(f"[筛选] 淘汰-{reason}: {len(items)} 只 → {items[:8]}{'...' if len(items) > 8 else ''}")
+    # 6. 近N日振幅 <7%
+    next_remaining = []
+    drop_vib = 0
+    for stock in remaining:
+        prices = price_cache[stock]
+        recent_prices = prices[-g.vib_period:]
+        max_high = recent_prices['high'].max()
+        min_low = recent_prices['low'].min()
+        vib = (max_high - min_low) / min_low if min_low > 0 else 999
+        if vib >= g.max_vib:
+            drop_vib += 1
+            continue
+        metrics.setdefault(stock, {})['vib'] = float(vib)
+        next_remaining.append(stock)
+    remaining = next_remaining
     
-    total_in = len(df_basic)
-    total_out = sum(len(v) for v in filtered.values())
-    log.info(f"[筛选漏斗] 基础{total_in} → 技术面{len(candidates)}(-{total_out}) → 取前5只买入")
+    candidates = remaining
+    g.candidates = candidates[:5]
     
-    g.candidates = candidates[:5]  # 只取前5只用于买入
-    log.info(f"[今日推荐] 共 {len(g.candidates)} 只（开盘买入）:")
-    for code in g.candidates:
-        try:
-            name = get_security_info(code).display_name
-            close = get_price(code, count=1, end_date=ref_date, fields=['close'])['close'][-1]
-            log.info(f"  {name} ({code}) 前收: {close:.2f}")
-        except Exception:
-            log.info(f"  - ({code})")
+    log.info(
+        f"[筛选漏斗] 基础{basic_count}"
+        f" → 数据{after_data}(-{drop_data})"
+        f" → EMA{after_ema}(-{drop_ema})"
+        f" → 成交额{after_amount}(-{drop_amount})"
+        f" → 融资{after_margin}(无数据-{drop_no_data}/增幅不足-{drop_rate})"
+        f" → 振幅{len(candidates)}(-{drop_vib})"
+        f" → 取前{len(g.candidates)}只"
+    )
+    # 最终入选个股：打印名称/代码/行业及全部筛选指标
+    _log_recommend_cards(g.candidates, metrics, ref_date)
+    log.info(f"选股基准日(前一交易日): {ref_date}")
+    _log_section_banner(context, _select_section_name(context))
 
 
 def calc_sell_list(context):
     """收盘后15:35 计算待卖出列表，次日早盘执行。需分钟回测。"""
+    try:
+        _calc_sell_list_body(context)
+    finally:
+        _log_section_banner(context, '收盘后风控 15:35 计算待卖出')
+
+
+def _calc_sell_list_body(context):
     # === 整体收益率与回撤空仓检查（每日收盘必算）===
     starting_cash = context.portfolio.starting_cash
     total_value = context.portfolio.total_value
@@ -202,6 +317,7 @@ def calc_sell_list(context):
     positions = list(context.portfolio.positions.keys())
     g.to_sell = {}
     if not positions:
+        log.info('[收盘后] 当前无持仓，无需计算卖出')
         return
     # 若本次触发回撤空仓，将全部持仓加入待卖出
     if g.empty_until is not None and drawdown >= drawdown_pct and positions:
@@ -212,7 +328,7 @@ def calc_sell_list(context):
     data = get_current_data()
     loss_threshold_pct = getattr(g, 'loss_threshold_pct', 0.015)
     today = context.current_dt
-    log.info(f"========== 收盘后计算待卖出 持仓{len(positions)}只 ==========")
+    log.info(f"[收盘后] 开始逐票检查 持仓{len(positions)}只")
     for stock in positions:
         if stock not in g.hold_days:
             g.hold_days[stock] = 0
@@ -275,13 +391,22 @@ def calc_sell_list(context):
 
 def my_trade(context):
     """早盘09:30 执行：先卖（尾盘已计算）后买"""
+    try:
+        _my_trade_body(context)
+    finally:
+        _log_section_banner(context, '早盘交易 09:30 卖出+买入')
+
+
+def _my_trade_body(context):
     data = get_current_data()
     loss_threshold_pct = getattr(g, 'loss_threshold_pct', 0.015)
     to_sell = getattr(g, 'to_sell', {})
     
     # === 卖出逻辑：执行尾盘计算的待卖出 ===
     if to_sell:
-        log.info(f"========== 早盘执行卖出 共{len(to_sell)}只（昨日收盘后已计算） ==========")
+        log.info(f"[早盘] 执行待卖出 共{len(to_sell)}只（昨日收盘后已计算）")
+    else:
+        log.info('[早盘] 无待卖出')
     for stock, reason in list(to_sell.items()):
         if stock not in context.portfolio.positions:
             continue
@@ -313,12 +438,17 @@ def my_trade(context):
         log.info(f"[早盘] 空仓期中，截止{empty_until}，仅卖不买")
         return
     if len(context.portfolio.positions) >= g.max_positions:
+        log.info(f"[早盘] 已满仓({g.max_positions})，跳过买入")
         return
     
     total_value = context.portfolio.total_value
     target_value_per = total_value * g.position_pct
+    cand = getattr(g, 'candidates', [])
+    if not cand:
+        log.info('[早盘] 无候选股，跳过买入')
+        return
     
-    for stock in g.candidates[:g.max_positions]:
+    for stock in cand[:g.max_positions]:
         if stock in context.portfolio.positions:
             continue
         if len(context.portfolio.positions) >= g.max_positions:
@@ -344,4 +474,3 @@ def my_trade(context):
         g.hold_high[stock] = cur_price  # 买入时初始化持有周期最高价
         g.entry_atr[stock] = entry_atr  # 买入时ATR，用于成本区计算
         log.info(f"【买入】 {stock} 目标{target_value_per:.0f}(20%), 止损价={stop_price:.2f}(仓位亏损≥总仓{loss_threshold_pct:.1%}), ATR={entry_atr:.2f}")
-        
